@@ -63,6 +63,25 @@ else
   echo "  ADD   CLAUDE.md with @import"
 fi
 
+# Copy skills
+SKILLS_SRC="$SCRIPT_DIR/.claude/skills"
+SKILLS_DEST="$CLAUDE_DIR/skills"
+
+if [ -d "$SKILLS_SRC" ]; then
+  for skill_dir in "$SKILLS_SRC"/*/; do
+    skill_name=$(basename "$skill_dir")
+    dest_dir="$SKILLS_DEST/$skill_name"
+
+    if [ -d "$dest_dir" ]; then
+      echo "  SKIP  skills/$skill_name (already exists)"
+    else
+      mkdir -p "$dest_dir"
+      cp -r "$skill_dir"* "$dest_dir/"
+      echo "  ADD   skills/$skill_name"
+    fi
+  done
+fi
+
 # Symlink claude-loop into the project (or user's PATH)
 LOOP_SRC="$SCRIPT_DIR/claude-loop"
 LOOP_DEST="$TARGET_DIR/claude-loop"
@@ -88,14 +107,15 @@ done
 
 echo ""
 echo "Done. Installed:"
-echo "  .claude/agents/researcher.md   — read-only codebase explorer (Sonnet)"
-echo "  .claude/agents/implementer.md  — code writer in isolated worktree (Sonnet)"
-echo "  .claude/agents/reviewer.md     — code reviewer and test runner (Sonnet)"
-echo "  .claude/agents/planner.md      — architectural planner (Opus)"
-echo "  .claude/orchestration.md       — orchestration rules (@imported into CLAUDE.md)"
-echo "  claude-loop                    — infinite session runner"
+echo "  .claude/agents/researcher.md        — read-only codebase explorer (Sonnet)"
+echo "  .claude/agents/implementer.md       — code writer in isolated worktree (Sonnet)"
+echo "  .claude/agents/reviewer.md          — code reviewer and test runner (Sonnet)"
+echo "  .claude/agents/planner.md           — architectural planner (Opus)"
+echo "  .claude/skills/create_plan/         — interactive plan creation skill"
+echo "  .claude/orchestration.md            — orchestration rules (@imported into CLAUDE.md)"
+echo "  claude-loop                         — infinite session runner"
 echo ""
-echo "Two ways to use:"
+echo "Usage:"
 echo ""
-echo "  1. Interactive:  claude          (orchestrator mode via CLAUDE.md)"
-echo "  2. Autonomous:   ./claude-loop \"your task here\""
+echo "  1. Create a plan:  claude → /create_plan"
+echo "  2. Execute it:     ./claude-loop plans/my-plan.md"
