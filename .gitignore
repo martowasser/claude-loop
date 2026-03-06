@@ -1,0 +1,13 @@
+# Agent memory is per-developer, never committed
+.claude/agent-memory-local/
+.claude/agent-memory/
+
+# Session state is transient, per-developer
+.claude/state.md
+.claude/progress.md
+.claude/progress_*.md
+.claude/signal
+.claude/feedback.md
+.claude/scratch/
+.claude/loop.pid
+.claude/loop.log

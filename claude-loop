@@ -1,0 +1,583 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# claude-loop: Infinite-context plan executor
+#
+# Takes a plan file (from /create_plan) and executes it across fresh sessions.
+# Each session reads the plan + state, implements the next steps, updates state,
+# and exits. Between sessions, shows you what changed and asks to continue.
+#
+# Usage:
+#   claude-loop thoughts/shared/plans/my-feature.md
+#   claude-loop thoughts/shared/plans/my-feature.md --budget 2.00
+#   claude-loop thoughts/shared/plans/my-feature.md --yolo
+#   claude-loop thoughts/shared/plans/my-feature.md --supervised
+#   claude-loop thoughts/shared/plans/my-feature.md --tmux
+#   claude-loop --resume
+#
+# Modes:
+#   (default)      Interactive checkpoints between sessions
+#   --yolo         No checkpoints, runs unattended
+#   --supervised   No checkpoints, writes PID + log, checks for feedback file.
+#                  Designed to be launched from inside another Claude session.
+#   --tmux         Like default, but runs in a tmux layout with live monitoring.
+
+STATE_FILE=".claude/state.md"
+PROGRESS_FILE=".claude/progress.md"
+SIGNAL_FILE=".claude/signal"
+FEEDBACK_FILE=".claude/feedback.md"
+PID_FILE=".claude/loop.pid"
+LOG_FILE=".claude/loop.log"
+MAX_ITERATIONS=20
+MAX_PROGRESS_ENTRIES=20
+BUDGET=""
+MODEL="opus"
+PLAN_FILE=""
+RESUME=false
+BASE_BRANCH=""
+MODE="interactive"  # interactive | yolo | supervised | tmux
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --budget)
+      BUDGET="$2"
+      shift 2
+      ;;
+    --model)
+      MODEL="$2"
+      shift 2
+      ;;
+    --max-iterations)
+      MAX_ITERATIONS="$2"
+      shift 2
+      ;;
+    --resume)
+      RESUME=true
+      shift
+      ;;
+    --base-branch)
+      BASE_BRANCH="$2"
+      shift 2
+      ;;
+    --yolo)
+      MODE="yolo"
+      shift
+      ;;
+    --supervised)
+      MODE="supervised"
+      shift
+      ;;
+    --tmux)
+      MODE="tmux"
+      shift
+      ;;
+    --*)
+      echo "Unknown flag: $1"
+      exit 1
+      ;;
+    *)
+      PLAN_FILE="$1"
+      shift
+      ;;
+  esac
+done
+
+# Validate input
+if [ "$RESUME" = false ] && [ -z "$PLAN_FILE" ]; then
+  echo "Usage: claude-loop <plan-file> [flags]"
+  echo "       claude-loop --resume [flags]"
+  echo ""
+  echo "Flags:"
+  echo "  --budget N          Cap each session at N dollars"
+  echo "  --model M           Model to use (default: opus)"
+  echo "  --base-branch B     Create feature branch from B"
+  echo "  --max-iterations N  Max sessions before stopping (default: 20)"
+  echo "  --yolo              Skip checkpoints, run unattended"
+  echo "  --supervised        Run in supervised mode (for launching from another Claude session)"
+  echo "  --tmux              Run in tmux with live monitoring pane"
+  exit 1
+fi
+
+if [ -n "$PLAN_FILE" ] && [ ! -f "$PLAN_FILE" ]; then
+  echo "Error: Plan file not found: $PLAN_FILE"
+  exit 1
+fi
+
+# ─── tmux mode: re-launch inside tmux if not already ───
+
+if [ "$MODE" = "tmux" ]; then
+  if [ -z "${TMUX:-}" ]; then
+    # Not inside tmux — create session with split layout
+    SESSION_NAME="claude-loop-$$"
+
+    # Build the command to run inside tmux (re-invoke ourselves without --tmux)
+    SELF_CMD="$(printf '%q ' "$0" "${@/--tmux/}" --yolo)"
+
+    # Create session: left pane = monitor, right pane = loop
+    tmux new-session -d -s "$SESSION_NAME" -n "loop" \
+      "watch -n2 'echo \"── State ──\" && cat $STATE_FILE 2>/dev/null && echo && echo \"── Progress (last 5) ──\" && tail -30 $PROGRESS_FILE 2>/dev/null && echo && echo \"── Git Log ──\" && git log --oneline -5 2>/dev/null'"
+
+    tmux split-window -h -l '70%' -t "$SESSION_NAME:loop" \
+      "bash -c '$SELF_CMD; echo; echo \"Loop finished. Press Enter to close.\"; read'"
+
+    tmux set-option -t "$SESSION_NAME" mouse on
+    tmux select-pane -t "$SESSION_NAME:loop.1"
+    exec tmux attach-session -t "$SESSION_NAME"
+  fi
+  # If already inside tmux, just run as yolo (the tmux panes are set up)
+  MODE="yolo"
+fi
+
+# ─── Setup ───
+
+log() {
+  local msg="[$(date '+%H:%M:%S')] $1"
+  echo "$msg"
+  if [ "$MODE" = "supervised" ]; then
+    echo "$msg" >> "$LOG_FILE"
+  fi
+}
+
+if [ "$MODE" = "supervised" ]; then
+  mkdir -p "$(dirname "$PID_FILE")"
+  echo $$ > "$PID_FILE"
+  : > "$LOG_FILE"
+  log "Supervised mode. PID=$$"
+  log "  State:    $STATE_FILE"
+  log "  Progress: $PROGRESS_FILE"
+  log "  Log:      $LOG_FILE"
+  log "  Feedback: $FEEDBACK_FILE (write here to inject instructions)"
+  log "  Stop:     kill \$(cat $PID_FILE)"
+fi
+
+cleanup() {
+  rm -f "$PID_FILE" "$SIGNAL_FILE"
+  if [ "$MODE" = "supervised" ]; then
+    log "Loop terminated."
+  fi
+}
+trap cleanup EXIT
+
+# Ensure .claude directory exists
+mkdir -p .claude
+
+# Initialize progress log if missing
+if [ ! -f "$PROGRESS_FILE" ]; then
+  echo "# Progress Log" > "$PROGRESS_FILE"
+fi
+
+# Build common CLI args
+CLI_ARGS=(
+  -p
+  --model "$MODEL"
+  --dangerously-skip-permissions
+)
+
+if [ -n "$BUDGET" ]; then
+  CLI_ARGS+=(--max-budget-usd "$BUDGET")
+fi
+
+# ─── Helpers ───
+
+# Read signal file (replaces fragile stdout parsing)
+read_signal() {
+  if [ -f "$SIGNAL_FILE" ]; then
+    cat "$SIGNAL_FILE" | tr -d '[:space:]'
+  else
+    echo "continue"
+  fi
+}
+
+# Read plan path from state file (for --resume when no plan file given)
+resolve_plan_file() {
+  if [ -n "$PLAN_FILE" ]; then
+    return
+  fi
+  if [ -f "$STATE_FILE" ]; then
+    local plan_path
+    plan_path=$(grep -m1 "^## Plan" "$STATE_FILE" -A1 | tail -1 | tr -d '[:space:]') || true
+    if [ -n "$plan_path" ] && [ -f "$plan_path" ]; then
+      PLAN_FILE="$plan_path"
+      log "Resolved plan from state: $PLAN_FILE"
+    fi
+  fi
+}
+
+snapshot_git() {
+  GIT_SNAPSHOT=$(git rev-parse HEAD 2>/dev/null || echo "none")
+}
+
+# On failure: revert code changes but keep state + progress
+revert_on_failure() {
+  if [ "$GIT_SNAPSHOT" = "none" ]; then
+    return
+  fi
+
+  local current_head
+  current_head=$(git rev-parse HEAD 2>/dev/null || echo "none")
+
+  if [ "$current_head" = "$GIT_SNAPSHOT" ]; then
+    # No commits were made, but there might be uncommitted changes
+    git checkout . 2>/dev/null || true
+    git clean -fd --exclude='.claude/' 2>/dev/null || true
+    return
+  fi
+
+  log "Reverting failed session (preserving state + progress)..."
+
+  # Save state files
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  cp "$STATE_FILE" "$tmpdir/state.md" 2>/dev/null || true
+  cp "$PROGRESS_FILE" "$tmpdir/progress.md" 2>/dev/null || true
+
+  # Hard reset to pre-session commit
+  git reset --hard "$GIT_SNAPSHOT" 2>/dev/null || true
+  git clean -fd --exclude='.claude/' 2>/dev/null || true
+
+  # Restore state files
+  cp "$tmpdir/state.md" "$STATE_FILE" 2>/dev/null || true
+  cp "$tmpdir/progress.md" "$PROGRESS_FILE" 2>/dev/null || true
+  rm -rf "$tmpdir"
+}
+
+# Archive progress if it has too many entries
+archive_progress() {
+  local count
+  count=$(grep -c "^## Session " "$PROGRESS_FILE" 2>/dev/null) || true
+
+  if [ "${count:-0}" -ge "$MAX_PROGRESS_ENTRIES" ]; then
+    local next_num=1
+    local last
+    last=$(ls -1 .claude/progress_*.md 2>/dev/null | grep -oP 'progress_\K\d+' | sort -n | tail -1) || true
+    if [ -n "$last" ]; then
+      next_num=$((10#$last + 1))
+    fi
+    local archive_name
+    archive_name=$(printf '.claude/progress_%03d.md' "$next_num")
+    mv "$PROGRESS_FILE" "$archive_name"
+    echo "# Progress Log" > "$PROGRESS_FILE"
+    log "Archived progress to $archive_name"
+  fi
+}
+
+# Append a session summary to progress log
+append_progress() {
+  local session_num="$1"
+  local signal="$2"
+  local timestamp
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+  # Read state for summary
+  local progress_summary=""
+  if [ -f "$STATE_FILE" ]; then
+    progress_summary=$(grep -A50 "^## Progress" "$STATE_FILE" | head -20) || true
+  fi
+
+  cat >> "$PROGRESS_FILE" << EOF
+
+## Session $session_num — $signal
+
+**Timestamp:** $timestamp
+
+$progress_summary
+
+---
+EOF
+
+  archive_progress
+}
+
+# Check for feedback file and build injection prompt
+consume_feedback() {
+  FEEDBACK_INJECTION=""
+  if [ -f "$FEEDBACK_FILE" ]; then
+    FEEDBACK_CONTENT=$(cat "$FEEDBACK_FILE")
+    if [ -n "$FEEDBACK_CONTENT" ]; then
+      FEEDBACK_INJECTION="
+
+## Feedback from Supervisor
+The following feedback was provided between sessions. You MUST incorporate it:
+
+$FEEDBACK_CONTENT
+"
+      log "Consumed feedback: $(head -1 "$FEEDBACK_FILE")"
+      rm "$FEEDBACK_FILE"
+    fi
+  fi
+}
+
+# Interactive checkpoint
+checkpoint() {
+  local session_num="$1"
+
+  if [ "$MODE" = "yolo" ] || [ "$MODE" = "supervised" ]; then
+    return 0
+  fi
+
+  echo ""
+  echo "┌──────────────────────────────────────────┐"
+  printf "│         SESSION %-2s COMPLETE               │\n" "$session_num"
+  echo "└──────────────────────────────────────────┘"
+  echo ""
+
+  # Show state summary
+  if [ -f "$STATE_FILE" ]; then
+    echo "── State ──"
+    grep -A100 "^## Progress" "$STATE_FILE" | head -20
+    echo ""
+  fi
+
+  # Show git changes since snapshot
+  local current_head
+  current_head=$(git rev-parse HEAD 2>/dev/null || echo "none")
+
+  if [ "$GIT_SNAPSHOT" != "none" ] && [ "$current_head" != "none" ]; then
+    if [ "$GIT_SNAPSHOT" != "$current_head" ]; then
+      echo "── Commits ──"
+      git log --oneline "$GIT_SNAPSHOT".."$current_head" 2>/dev/null || true
+      echo ""
+    fi
+    echo "── Files changed ──"
+    git diff --stat "$GIT_SNAPSHOT" 2>/dev/null || git diff --stat HEAD 2>/dev/null || true
+    echo ""
+  else
+    echo "── Uncommitted changes ──"
+    git diff --stat 2>/dev/null || true
+    git diff --stat --cached 2>/dev/null || true
+    echo ""
+  fi
+
+  while true; do
+    echo "What do you want to do?"
+    echo "  [c] Continue to next session"
+    echo "  [d] Show full diff"
+    echo "  [s] Show state file"
+    echo "  [p] Show progress log"
+    echo "  [q] Stop (progress saved, resume with --resume)"
+    echo ""
+    read -r -p "> " choice
+
+    case "$choice" in
+      c|C|"")
+        return 0
+        ;;
+      d|D)
+        echo ""
+        if [ "$GIT_SNAPSHOT" != "none" ] && [ "$GIT_SNAPSHOT" != "$current_head" ]; then
+          git diff "$GIT_SNAPSHOT" 2>/dev/null || git diff 2>/dev/null
+        else
+          git diff 2>/dev/null
+          git diff --cached 2>/dev/null
+        fi
+        echo ""
+        ;;
+      s|S)
+        echo ""
+        cat "$STATE_FILE" 2>/dev/null || echo "(no state file)"
+        echo ""
+        ;;
+      p|P)
+        echo ""
+        tail -50 "$PROGRESS_FILE" 2>/dev/null || echo "(no progress file)"
+        echo ""
+        ;;
+      q|Q)
+        echo ""
+        echo "Stopped. Progress saved in $STATE_FILE"
+        echo "Resume with: claude-loop --resume"
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $choice"
+        ;;
+    esac
+  done
+}
+
+# Run one session and handle result
+run_session() {
+  local session_num="$1"
+  local prompt="$2"
+
+  snapshot_git
+  rm -f "$SIGNAL_FILE"
+
+  OUTPUT=$(claude "${CLI_ARGS[@]}" "$prompt" 2>&1) || true
+  echo "$OUTPUT"
+  if [ "$MODE" = "supervised" ]; then
+    echo "$OUTPUT" >> "$LOG_FILE"
+  fi
+
+  # Read signal (written by Claude via bash during session)
+  local signal
+  signal=$(read_signal)
+
+  case "$signal" in
+    done)
+      append_progress "$session_num" "done"
+      log "Plan complete (session $session_num)"
+      return 2
+      ;;
+    failed)
+      append_progress "$session_num" "failed"
+      log "Session $session_num failed — reverting code changes"
+      revert_on_failure
+      return 1
+      ;;
+    *)
+      # continue (or missing signal — treat as continue)
+      append_progress "$session_num" "continue"
+      return 0
+      ;;
+  esac
+}
+
+# ─── Signal instructions (injected into every prompt) ───
+
+SIGNAL_INSTRUCTIONS='
+## Signaling (CRITICAL — controls the loop)
+
+Before finishing, you MUST write a signal file. This is how the loop knows what to do next:
+
+```bash
+# Made progress, more work to do
+echo "continue" > .claude/signal
+
+# All work is complete
+echo "done" > .claude/signal
+
+# This session failed (code changes will be reverted, progress preserved)
+echo "failed" > .claude/signal
+```
+
+You MUST write this signal as your LAST action. Without it the loop cannot continue.
+'
+
+# ─── First session: bootstrap from plan ───
+
+if [ "$RESUME" = true ]; then
+  if [ ! -f "$STATE_FILE" ]; then
+    echo "No state file found. Nothing to resume."
+    exit 1
+  fi
+  resolve_plan_file
+  log "Resuming from state (plan: ${PLAN_FILE:-none})"
+else
+  log "Executing plan: $PLAN_FILE"
+
+  PLAN_CONTENT=$(cat "$PLAN_FILE")
+
+  BRANCH_INSTRUCTION=""
+  if [ -n "$BASE_BRANCH" ]; then
+    BRANCH_INSTRUCTION="Create a new git branch from $BASE_BRANCH before making any changes. Use a descriptive branch name based on the plan."
+  fi
+
+  consume_feedback
+
+  PROMPT="$(cat <<PROMPT_EOF
+You are the lead orchestrator executing an implementation plan.
+
+## The Plan
+$PLAN_CONTENT
+
+## Instructions
+$BRANCH_INSTRUCTION
+
+You have specialized subagents available:
+- **researcher**: read-only codebase exploration, returns distilled findings
+- **implementer**: writes code in an isolated worktree
+- **reviewer**: reviews code and runs tests
+
+Execute the plan step by step:
+1. Read the plan carefully. Identify the implementation steps.
+2. For each step, delegate to the appropriate subagent with precise instructions (objective, output format, tool guidance, scope boundaries).
+3. After each step completes, verify the result before moving on.
+4. Commit your changes after completing each logical unit of work with a clear commit message.
+5. After each subagent returns, UPDATE .claude/state.md with current progress.
+6. Do as many steps as you can in this session.
+$FEEDBACK_INJECTION
+
+Before finishing, you MUST write .claude/state.md:
+
+\`\`\`markdown
+# Current State
+
+## Status
+CONTINUE or DONE
+
+## Plan
+$PLAN_FILE
+
+## Progress
+- [x] Completed steps with brief outcome
+- [ ] Remaining steps from the plan
+
+## Key Decisions
+- Any choices made during implementation
+
+## Context for Next Session
+What a fresh session needs to know to continue.
+File paths modified, patterns followed, anything non-obvious.
+\`\`\`
+$SIGNAL_INSTRUCTIONS
+PROMPT_EOF
+)"
+
+  local result=0
+  run_session 1 "$PROMPT" || result=$?
+
+  case $result in
+    2) exit 0 ;;  # done
+    1) ;;          # failed, will continue to retry in loop
+    0) ;;          # continue
+  esac
+
+  checkpoint 1
+fi
+
+# ─── Continuation loop ───
+
+ITERATION=1
+while [ $ITERATION -lt $MAX_ITERATIONS ]; do
+  ITERATION=$((ITERATION + 1))
+  log "Session $ITERATION (fresh context)"
+
+  consume_feedback
+
+  PROMPT="$(cat <<PROMPT_EOF
+You are the lead orchestrator resuming implementation of a plan.
+
+## Instructions
+1. Read .claude/state.md to see what's been done and what's next.
+2. Read the plan file at \`$PLAN_FILE\` — it is the clean, current source of truth for what to build.
+3. Check the state file for a \`## Plan Changes\` section. If present, it describes what changed since the last session. Steps marked for re-implementation should be treated as incomplete even if previously checked off.
+4. Continue from the next incomplete step (or re-implement changed steps).
+5. Delegate to subagents (researcher, implementer, reviewer) as needed.
+6. Each delegation MUST include: objective, output format, tool guidance, scope boundaries.
+7. Commit your changes after completing each logical unit of work with a clear commit message.
+8. After each subagent returns, UPDATE .claude/state.md with current progress.
+9. Do as many steps as you can in this session.
+10. Before finishing, UPDATE .claude/state.md.
+$FEEDBACK_INJECTION
+
+Do NOT re-implement completed steps unless they appear in \`## Plan Changes\`.
+$SIGNAL_INSTRUCTIONS
+PROMPT_EOF
+)"
+
+  local result=0
+  run_session "$ITERATION" "$PROMPT" || result=$?
+
+  case $result in
+    2) exit 0 ;;  # done
+    1) ;;          # failed, continue to retry
+    0) ;;          # continue
+  esac
+
+  checkpoint "$ITERATION"
+done
+
+log "Reached max iterations ($MAX_ITERATIONS). Progress saved in $STATE_FILE"
+exit 0
