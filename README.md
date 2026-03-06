@@ -28,10 +28,10 @@ Based on [How we built our multi-agent research system](https://www.anthropic.co
 ## Install
 
 ```bash
-git clone <repo-url> ~/claude-orchestrator
+git clone git@github.com:martowasser/claude-loop.git ~/claude-loop
 
 # Install into any project
-~/claude-orchestrator/install.sh /path/to/your/project
+~/claude-loop/install.sh /path/to/your/project
 ```
 
 This adds to your project:
