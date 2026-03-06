@@ -57,24 +57,24 @@ All runtime files (state, progress, signal, scratch, logs) are automatically add
 
 #### Phase 1: Plan (interactive)
 
-Use Claude Code as you normally would. Create a plan through conversation:
+Use Claude Code as you normally would. Create a plan through conversation — either by talking through the requirements or using a planning skill/workflow you've set up:
 
 ```
 $ claude
 
 You:    "I need to add a discount system to quotes"
 Claude: *asks questions, validates requirements, researches codebase*
-        → Writes thoughts/shared/plans/2026-03-06-quote-discounts.md
+        → Writes plans/2026-03-06-quote-discounts.md
 ```
 
-This phase is fully interactive. You steer the conversation, answer questions, make decisions. The output is a plan file on disk.
+This phase is fully interactive. You steer the conversation, answer questions, make decisions. The output is a plan file (markdown) saved anywhere in your project.
 
 #### Phase 2: Execute (autonomous)
 
 Hand the plan to `claude-loop`. It runs the implementation across fresh sessions:
 
 ```
-$ ./claude-loop thoughts/shared/plans/2026-03-06-quote-discounts.md
+$ ./claude-loop plans/2026-03-06-quote-discounts.md
 ```
 
 Or from inside a Claude session:
@@ -260,7 +260,7 @@ Researcher and reviewer write findings incrementally to `.claude/scratch/` as a 
 
 | File | Purpose | Persists |
 |---|---|---|
-| `thoughts/shared/plans/*.md` | The plan (source of truth) | Committed |
+| Your plan file (e.g. `plans/*.md`) | The plan (source of truth) | Committed |
 | `.claude/state.md` | Current progress + decisions | On disk, gitignored |
 | `.claude/progress.md` | Append-only session history | On disk, gitignored |
 | `.claude/progress_*.md` | Archived progress (after 20 entries) | On disk, gitignored |
@@ -299,7 +299,7 @@ Researcher and reviewer write findings incrementally to `.claude/scratch/` as a 
 **Committed (shared with team):**
 - `.claude/agents/*.md` — agent definitions
 - `.claude/orchestration.md` — orchestration rules
-- `thoughts/shared/plans/*.md` — plan files
+- Plan files (wherever your project stores them)
 
 **Local (per-developer, gitignored):**
 - `.claude/state.md` — active progress
