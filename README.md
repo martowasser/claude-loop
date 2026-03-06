@@ -44,6 +44,9 @@ your-project/
 │   │   ├── implementer.md
 │   │   ├── reviewer.md
 │   │   └── planner.md
+│   ├── skills/
+│   │   └── create_plan/
+│   │       └── SKILL.md
 │   └── orchestration.md
 ├── claude-loop
 └── CLAUDE.md              ← @import .claude/orchestration.md appended
@@ -57,17 +60,20 @@ All runtime files (state, progress, signal, scratch, logs) are automatically add
 
 #### Phase 1: Plan (interactive)
 
-Use Claude Code as you normally would. Create a plan through conversation — either by talking through the requirements or using a planning skill/workflow you've set up:
+Use the included `/create_plan` skill to create a plan through conversation:
 
 ```
 $ claude
 
-You:    "I need to add a discount system to quotes"
-Claude: *asks questions, validates requirements, researches codebase*
+You:    /create_plan
+Claude: *interviews you about requirements*
+        *researches the codebase*
+        *proposes design options*
+        *validates tech choices*
         → Writes plans/2026-03-06-quote-discounts.md
 ```
 
-This phase is fully interactive. You steer the conversation, answer questions, make decisions. The output is a plan file (markdown) saved anywhere in your project.
+The skill conducts deep interviews (goal, complexity, edge cases, tradeoffs), explores the codebase, presents design options, and validates tech choices before writing the plan. The output is a plan file (markdown) saved to your project.
 
 #### Phase 2: Execute (autonomous)
 
@@ -298,6 +304,7 @@ Researcher and reviewer write findings incrementally to `.claude/scratch/` as a 
 
 **Committed (shared with team):**
 - `.claude/agents/*.md` — agent definitions
+- `.claude/skills/create_plan/` — plan creation skill
 - `.claude/orchestration.md` — orchestration rules
 - Plan files (wherever your project stores them)
 
